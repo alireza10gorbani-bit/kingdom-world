@@ -1,310 +1,413 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const Database = require('better-sqlite3');
+const bcrypt = require('bcryptjs');
 const path = require('path');
+const fs = require('fs');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
-const JWT_SECRET = process.env.JWT_SECRET || 'kingdom-secret-2024';
-const ADMIN_USER = process.env.ADMIN_USER || 'admin';
-const ADMIN_PASS = process.env.ADMIN_PASS || 'admin1234';
 const PORT = process.env.PORT || 3000;
-
-const db = new Database('kingdom.db');
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL,
-    level INTEGER DEFAULT 1,
-    xp INTEGER DEFAULT 0,
-    kills INTEGER DEFAULT 0,
-    deaths INTEGER DEFAULT 0,
-    banned INTEGER DEFAULT 0,
-    ban_reason TEXT DEFAULT '',
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS reports (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    reporter TEXT NOT NULL,
-    reported TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    status TEXT DEFAULT 'pending',
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-`);
+const JWT_SECRET = process.env.JWT_SECRET || 'kingdom-world-secret-key-change-me';
+const ADMIN_USER = process.env.ADMIN_USER || 'admin';
+const ADMIN_PASS = process.env.ADMIN_PASS || 'admin123';
 
 app.use(express.json());
-app.use(express.static(path.join(__dirname, '../public')));
+app.use(express.static(path.join(__dirname, '..', 'public')));
 
-app.post('/api/register', async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) return res.json({ ok: false, msg: 'نام کاربری و رمز لازمه' });
-  if (username.length < 3) return res.json({ ok: false, msg: 'نام کاربری حداقل ۳ حرف' });
-  if (username === ADMIN_USER) return res.json({ ok: false, msg: 'این نام رزرو شده' });
+// ---------- Persistent-ish storage (simple JSON file) ----------
+const DB_FILE = path.join(__dirname, 'users.json');
+let users = {};
+function loadUsers() {
   try {
-    const bcrypt = require('bcryptjs');
-    const hash = await bcrypt.hash(password, 10);
-    db.prepare('INSERT INTO users (username, password) VALUES (?, ?)').run(username, hash);
-    const token = jwt.sign({ username, isAdmin: false }, JWT_SECRET);
-    res.json({ ok: true, token, username, level: 1, xp: 0 });
-  } catch (e) {
-    res.json({ ok: false, msg: 'این نام قبلاً ثبت شده' });
-  }
-});
-
-app.post('/api/login', async (req, res) => {
-  const { username, password } = req.body;
-  if (username === ADMIN_USER && password === ADMIN_PASS) {
-    const token = jwt.sign({ username, isAdmin: true }, JWT_SECRET);
-    return res.json({ ok: true, token, username, isAdmin: true, level: 99 });
-  }
-  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
-  if (!user) return res.json({ ok: false, msg: 'کاربر یافت نشد' });
-  if (user.banned) return res.json({ ok: false, msg: `بن شدی: ${user.ban_reason}` });
-  const bcrypt = require('bcryptjs');
-  const ok = await bcrypt.compare(password, user.password);
-  if (!ok) return res.json({ ok: false, msg: 'رمز اشتباهه' });
-  const token = jwt.sign({ username, isAdmin: false }, JWT_SECRET);
-  res.json({ ok: true, token, username, level: user.level, xp: user.xp, kills: user.kills });
-});
-
-app.get('/api/leaderboard', (req, res) => {
-  const rows = db.prepare('SELECT username, level, xp, kills FROM users WHERE banned=0 ORDER BY level DESC, xp DESC LIMIT 50').all();
-  res.json(rows);
-});
-
-function adminAuth(req, res, next) {
-  const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.json({ ok: false, msg: 'دسترسی نداری' });
-  try {
-    const d = jwt.verify(token, JWT_SECRET);
-    if (!d.isAdmin) return res.json({ ok: false, msg: 'فقط ادمین' });
-    next();
-  } catch { res.json({ ok: false, msg: 'توکن نامعتبر' }); }
+    if (fs.existsSync(DB_FILE)) users = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+  } catch (e) { console.error('load users failed', e); users = {}; }
 }
+function saveUsers() {
+  try { fs.writeFileSync(DB_FILE, JSON.stringify(users)); } catch (e) { console.error('save users failed', e); }
+}
+loadUsers();
 
-app.get('/api/admin/users', adminAuth, (req, res) => {
-  const users = db.prepare('SELECT id,username,level,xp,kills,deaths,banned,ban_reason,created_at FROM users ORDER BY id DESC').all();
-  res.json({ ok: true, users });
-});
-
-app.post('/api/admin/ban', adminAuth, (req, res) => {
-  const { username, reason } = req.body;
-  db.prepare('UPDATE users SET banned=1, ban_reason=? WHERE username=?').run(reason || 'تخلف', username);
-  const sock = onlinePlayers.get(username);
-  if (sock) io.to(sock).emit('kicked', 'بن شدی: ' + reason);
-  res.json({ ok: true });
-});
-
-app.post('/api/admin/unban', adminAuth, (req, res) => {
-  db.prepare('UPDATE users SET banned=0, ban_reason="" WHERE username=?').run(req.body.username);
-  res.json({ ok: true });
-});
-
-app.get('/api/admin/reports', adminAuth, (req, res) => {
-  res.json({ ok: true, reports: db.prepare('SELECT * FROM reports ORDER BY id DESC').all() });
-});
-
-app.post('/api/admin/report-status', adminAuth, (req, res) => {
-  db.prepare('UPDATE reports SET status=? WHERE id=?').run(req.body.status, req.body.id);
-  res.json({ ok: true });
-});
-
-app.get('/api/admin/stats', adminAuth, (req, res) => {
-  res.json({
-    ok: true,
-    total: db.prepare('SELECT COUNT(*) as c FROM users').get().c,
-    banned: db.prepare('SELECT COUNT(*) as c FROM users WHERE banned=1').get().c,
-    online: gameState.players.size,
-    pendingReports: db.prepare('SELECT COUNT(*) as c FROM reports WHERE status="pending"').get().c,
-  });
-});
-
-app.post('/api/admin/broadcast', adminAuth, (req, res) => {
-  io.emit('systemMsg', req.body.msg);
-  res.json({ ok: true });
-});
-
-const MAP_W = 80, MAP_H = 80, TILE = 48;
-const T = { GRASS:0, WATER:1, TREE:10, STONE:11, RIVER:12, HOUSE:20, TOWER:21, WALL:22, CASTLE:23, FARM:24, CATTLE:30, SHEEP:31, CHICKEN:32 };
+// ---------- Map generation ----------
+const TILE = { GRASS:0, WATER:1, TREE:10, STONE:11, RIVER:12, HOUSE:20, TOWER:21, WALL:22, CASTLE:23, FARM:24, CATTLE:30, SHEEP:31, CHICKEN:32 };
+const MAP_W = 80, MAP_H = 80, TPX = 48;
 
 function generateMap() {
   const map = [];
   for (let y = 0; y < MAP_H; y++) {
-    map[y] = [];
+    const row = [];
     for (let x = 0; x < MAP_W; x++) {
-      const n = Math.sin(x*0.3)*Math.cos(y*0.3)*0.5+0.5;
-      map[y][x] = { type: n < 0.2 ? T.WATER : T.GRASS, owner: null, hp: 0 };
+      let type = TILE.GRASS;
+      const r = Math.random();
+      if (Math.abs(x - 40 - Math.sin(y/8)*6) < 1.5) type = TILE.RIVER;
+      else if (r < 0.06) type = TILE.TREE;
+      else if (r < 0.09) type = TILE.STONE;
+      else if (r < 0.11) type = TILE.CATTLE;
+      else if (r < 0.13) type = TILE.SHEEP;
+      else if (r < 0.15) type = TILE.CHICKEN;
+      row.push({ type, owner: null });
     }
-  }
-  for (let i = 0; i < 280; i++) {
-    const x=Math.floor(Math.random()*MAP_W), y=Math.floor(Math.random()*MAP_H);
-    if (map[y][x].type===T.GRASS) map[y][x]={ type:T.TREE, owner:null, hp:5 };
-  }
-  for (let i = 0; i < 140; i++) {
-    const x=Math.floor(Math.random()*MAP_W), y=Math.floor(Math.random()*MAP_H);
-    if (map[y][x].type===T.GRASS) map[y][x]={ type:T.STONE, owner:null, hp:8 };
-  }
-  for (let i = 0; i < 3; i++) {
-    const ry=10+Math.floor(Math.random()*60);
-    for (let x=0; x<MAP_W; x++) if (map[ry][x].type===T.GRASS) map[ry][x]={ type:T.RIVER, owner:null, hp:0 };
-  }
-  for (let i = 0; i < 50; i++) {
-    const x=Math.floor(Math.random()*MAP_W), y=Math.floor(Math.random()*MAP_H);
-    if (map[y][x].type===T.GRASS) map[y][x]={ type:[T.CATTLE,T.SHEEP,T.CHICKEN][Math.floor(Math.random()*3)], owner:null, hp:3 };
+    map.push(row);
   }
   return map;
 }
+const gameMap = generateMap();
 
-const gameState = { map: generateMap(), players: new Map() };
-const onlinePlayers = new Map();
+// ---------- Game state ----------
+const players = new Map();
+const sockets = new Map();
+let botCounter = 0;
+let realPlayerEverJoined = false;
 
+function randSpawn() {
+  return { x: (5 + Math.random() * (MAP_W - 10)) * TPX, y: (5 + Math.random() * (MAP_H - 10)) * TPX };
+}
+
+function makePlayerState(username, color, saved) {
+  const spawn = randSpawn();
+  return {
+    id: null,
+    username,
+    color: color || '#cc3333',
+    x: spawn.x, y: spawn.y,
+    hp: 100, maxHp: 100,
+    level: saved?.level || 1,
+    xp: saved?.xp || 0,
+    kills: saved?.kills || 0,
+    wood: saved?.wood || 0,
+    stone: saved?.stone || 0,
+    food: saved?.food || 0,
+    gold: saved?.gold || 50,
+    isBot: false,
+    lastAttack: 0
+  };
+}
+
+function broadcastPlayerList() {
+  io.emit('onlineCount', players.size);
+}
+
+function publicPlayer(p) {
+  return { id: p.id, username: p.username, color: p.color, x: p.x, y: p.y, hp: p.hp, maxHp: p.maxHp, level: p.level, xp: p.xp, kills: p.kills };
+}
+
+function addXp(p, amount) {
+  p.xp += amount;
+  const needed = p.level * 1000;
+  if (p.xp >= needed) {
+    p.level += 1;
+    p.maxHp += 10;
+    p.hp = p.maxHp;
+    io.to(p.id).emit('notif', `🎉 لول آپ شدی! حالا لول ${p.level} هستی`);
+  }
+}
+
+function persistPlayer(p) {
+  if (p.isBot) return;
+  users[p.username] = users[p.username] || {};
+  Object.assign(users[p.username], {
+    username: p.username, color: p.color, level: p.level, xp: p.xp,
+    kills: p.kills, wood: p.wood, stone: p.stone, food: p.food, gold: p.gold
+  });
+}
+
+// ---------- Bots ----------
+const BOT_NAMES = ['اژدها','شوالیه_تنها','گرگ_خاکستری','تیرانداز','جنگجو_شب','پادشاه_سایه','شیر_بیابان','عقاب_طلایی'];
+function spawnBot() {
+  botCounter++;
+  const name = BOT_NAMES[botCounter % BOT_NAMES.length] + '_' + botCounter;
+  const colors = ['#cc3333','#3366cc','#33aa44','#cc8800','#9933cc','#cc6633'];
+  const p = makePlayerState(name, colors[botCounter % colors.length], null);
+  p.id = 'bot_' + botCounter;
+  p.isBot = true;
+  players.set(p.id, p);
+  io.emit('playerJoined', publicPlayer(p));
+  broadcastPlayerList();
+}
+
+function botTick() {
+  for (const [id, p] of players) {
+    if (!p.isBot) continue;
+    if (Math.random() < 0.3) {
+      const dx = (Math.random() - 0.5) * 120;
+      const dy = (Math.random() - 0.5) * 120;
+      p.x = Math.max(0, Math.min(MAP_W * TPX, p.x + dx));
+      p.y = Math.max(0, Math.min(MAP_H * TPX, p.y + dy));
+      io.emit('playerMoved', { id, x: p.x, y: p.y });
+    }
+    if (Math.random() < 0.5) {
+      p.wood += 1; p.stone += 1; p.food += 1;
+    }
+  }
+}
+setInterval(botTick, 4000);
+
+setTimeout(() => {
+  if (!realPlayerEverJoined) {
+    for (let i = 0; i < 5; i++) spawnBot();
+    io.emit('systemMsg', '🤖 چندتا بازیکن به دنیا اضافه شدن!');
+  }
+}, 60 * 1000);
+
+// ---------- Auth API ----------
+app.post('/api/register', (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) return res.json({ ok: false, msg: 'همه فیلدها لازمه' });
+  if (users[username]) return res.json({ ok: false, msg: 'این نام کاربری قبلاً ثبت شده' });
+  const passHash = bcrypt.hashSync(password, 8);
+  users[username] = { username, passHash, color: '#cc3333', level: 1, xp: 0, kills: 0, wood: 0, stone: 0, food: 0, gold: 50 };
+  saveUsers();
+  const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '30d' });
+  res.json({ ok: true, token, username, level: 1 });
+});
+
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body || {};
+  if (username === ADMIN_USER && password === ADMIN_PASS) {
+    const token = jwt.sign({ username, admin: true }, JWT_SECRET, { expiresIn: '7d' });
+    return res.json({ ok: true, isAdmin: true, token, username });
+  }
+  const u = users[username];
+  if (!u || !bcrypt.compareSync(password, u.passHash || '')) {
+    return res.json({ ok: false, msg: 'نام کاربری یا رمز اشتباهه' });
+  }
+  const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '30d' });
+  res.json({ ok: true, token, username, level: u.level || 1 });
+});
+
+app.get('/api/leaderboard', (req, res) => {
+  const list = Object.values(users)
+    .map(u => ({ username: u.username, level: u.level || 1, kills: u.kills || 0 }))
+    .sort((a, b) => b.level - a.level || b.kills - a.kills)
+    .slice(0, 50);
+  res.json(list);
+});
+
+function requireAdmin(req, res, next) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  try {
+    const data = jwt.verify(token, JWT_SECRET);
+    if (!data.admin) return res.status(403).json({ ok: false });
+    next();
+  } catch { res.status(401).json({ ok: false }); }
+}
+app.get('/api/admin/players', requireAdmin, (req, res) => {
+  res.json(Array.from(players.values()).map(publicPlayer));
+});
+app.get('/api/admin/users', requireAdmin, (req, res) => {
+  res.json(Object.values(users).map(u => ({ username: u.username, level: u.level, kills: u.kills })));
+});
+
+// ---------- Socket.io game logic ----------
 io.on('connection', (socket) => {
-  let currentUser = null;
+  sockets.set(socket.id, socket);
 
-  socket.on('join', (data) => {
+  socket.on('join', ({ token, color }) => {
+    let username;
     try {
-      const decoded = jwt.verify(data.token, JWT_SECRET);
-      currentUser = decoded.username;
-      if (decoded.isAdmin) return;
-      const user = db.prepare('SELECT * FROM users WHERE username=?').get(currentUser);
-      if (!user || user.banned) { socket.emit('kicked', 'بن شدی'); return; }
-      onlinePlayers.set(currentUser, socket.id);
-      const p = {
-        id: socket.id, username: currentUser,
-        x: 200+Math.random()*(MAP_W*TILE-400), y: 200+Math.random()*(MAP_H*TILE-400),
-        hp: 100, maxHp: 100, level: user.level, xp: user.xp, kills: user.kills,
-        wood: 50, stone: 30, food: 50, gold: 100,
-        color: data.color || '#cc3333', territory: [], units: [],
-      };
-      gameState.players.set(socket.id, p);
-      socket.emit('init', { map: gameState.map, players: Array.from(gameState.players.values()), myId: socket.id });
-      socket.broadcast.emit('playerJoined', p);
-      io.emit('systemMsg', `⚔️ ${currentUser} وارد دنیا شد`);
-    } catch { socket.emit('kicked', 'خطا'); }
+      const data = jwt.verify(token, JWT_SECRET);
+      username = data.username;
+    } catch {
+      socket.emit('kicked', 'توکن نامعتبره، دوباره وارد شو');
+      return;
+    }
+    realPlayerEverJoined = true;
+    const saved = users[username];
+    const p = makePlayerState(username, color || saved?.color, saved);
+    p.id = socket.id;
+    players.set(socket.id, p);
+
+    socket.emit('init', {
+      map: gameMap,
+      myId: socket.id,
+      players: Array.from(players.values()).map(publicPlayer)
+    });
+    socket.broadcast.emit('playerJoined', publicPlayer(p));
+    io.emit('systemMsg', `👑 ${username} وارد سرزمین شد`);
+    broadcastPlayerList();
   });
 
-  socket.on('move', (d) => {
-    const p = gameState.players.get(socket.id); if (!p) return;
-    p.x = Math.max(0, Math.min(MAP_W*TILE, d.x));
-    p.y = Math.max(0, Math.min(MAP_H*TILE, d.y));
+  socket.on('move', ({ x, y }) => {
+    const p = players.get(socket.id);
+    if (!p) return;
+    p.x = Math.max(0, Math.min(MAP_W * TPX, x));
+    p.y = Math.max(0, Math.min(MAP_H * TPX, y));
     socket.broadcast.emit('playerMoved', { id: socket.id, x: p.x, y: p.y });
   });
 
-  socket.on('attack', (d) => {
-    const a = gameState.players.get(socket.id), t = gameState.players.get(d.targetId);
-    if (!a || !t) return;
-    const dx=t.x-a.x, dy=t.y-a.y;
-    if (Math.sqrt(dx*dx+dy*dy) > 120) return;
-    const dmg = 10 + a.level * 2;
+  socket.on('chop', ({ tx, ty }) => {
+    const p = players.get(socket.id);
+    if (!p || !inBounds(tx, ty)) return;
+    const tile = gameMap[ty][tx];
+    if (tile.type !== TILE.TREE) return;
+    if (!nearTile(p, tx, ty)) return;
+    tile.type = TILE.GRASS;
+    p.wood += 5;
+    addXp(p, 10);
+    io.emit('tileChanged', { tx, ty, tile });
+    socket.emit('resources', resourcesOf(p));
+    setTimeout(() => {
+      if (gameMap[ty][tx].type === TILE.GRASS && Math.random() < 0.3) {
+        gameMap[ty][tx].type = TILE.TREE;
+        io.emit('tileChanged', { tx, ty, tile: gameMap[ty][tx] });
+      }
+    }, 30000);
+  });
+
+  socket.on('mine', ({ tx, ty }) => {
+    const p = players.get(socket.id);
+    if (!p || !inBounds(tx, ty)) return;
+    const tile = gameMap[ty][tx];
+    if (tile.type !== TILE.STONE) return;
+    if (!nearTile(p, tx, ty)) return;
+    tile.type = TILE.GRASS;
+    p.stone += 5;
+    addXp(p, 10);
+    io.emit('tileChanged', { tx, ty, tile });
+    socket.emit('resources', resourcesOf(p));
+    setTimeout(() => {
+      if (gameMap[ty][tx].type === TILE.GRASS && Math.random() < 0.3) {
+        gameMap[ty][tx].type = TILE.STONE;
+        io.emit('tileChanged', { tx, ty, tile: gameMap[ty][tx] });
+      }
+    }, 30000);
+  });
+
+  socket.on('harvest', ({ tx, ty }) => {
+    const p = players.get(socket.id);
+    if (!p || !inBounds(tx, ty)) return;
+    const tile = gameMap[ty][tx];
+    if (![TILE.CATTLE, TILE.SHEEP, TILE.CHICKEN, TILE.RIVER].includes(tile.type)) return;
+    if (!nearTile(p, tx, ty)) return;
+    p.food += 8;
+    addXp(p, 8);
+    socket.emit('resources', resourcesOf(p));
+  });
+
+  socket.on('build', ({ tx, ty, type }) => {
+    const p = players.get(socket.id);
+    if (!p || !inBounds(tx, ty)) return;
+    const tile = gameMap[ty][tx];
+    if (tile.type !== TILE.GRASS) { socket.emit('notif', '❌ اینجا نمی‌تونی بسازی'); return; }
+    const costs = {
+      [TILE.HOUSE]:  { wood:15, stone:5 },
+      [TILE.TOWER]:  { wood:10, stone:20 },
+      [TILE.WALL]:   { wood:0,  stone:8 },
+      [TILE.CASTLE]: { wood:50, stone:80 },
+      [TILE.FARM]:   { wood:20, stone:0 },
+    };
+    const cost = costs[type];
+    if (!cost) return;
+    if (p.wood < cost.wood || p.stone < cost.stone) { socket.emit('notif', '❌ منابع کافی نیست'); return; }
+    p.wood -= cost.wood; p.stone -= cost.stone;
+    tile.type = type; tile.owner = p.username;
+    addXp(p, 25);
+    io.emit('tileChanged', { tx, ty, tile });
+    socket.emit('resources', resourcesOf(p));
+    socket.emit('notif', '🏗️ ساخته شد!');
+  });
+
+  socket.on('recruit', ({ role, weapon }) => {
+    const p = players.get(socket.id);
+    if (!p) return;
+    const costs = {
+      sword:  { gold:40, food:20 },
+      bow:    { gold:40, food:20 },
+      cannon: { gold:60, food:30 },
+      none:   { gold:20, food:10 },
+    };
+    const cost = costs[weapon] || costs.none;
+    if (p.gold < cost.gold || p.food < cost.food) { socket.emit('notif', '❌ منابع کافی نیست'); return; }
+    p.gold -= cost.gold; p.food -= cost.food;
+    p.maxHp += role === 'soldier' ? 15 : 5;
+    p.hp = p.maxHp;
+    addXp(p, 15);
+    socket.emit('resources', resourcesOf(p));
+    socket.emit('notif', `✅ ${role === 'soldier' ? 'سرباز' : 'شهروند'} استخدام شد!`);
+  });
+
+  socket.on('attack', ({ targetId }) => {
+    const p = players.get(socket.id);
+    const t = players.get(targetId);
+    if (!p || !t) return;
+    const dx = t.x - p.x, dy = t.y - p.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist > 220) { socket.emit('notif', '❌ خیلی دوره'); return; }
+    const now = Date.now();
+    if (now - p.lastAttack < 800) return;
+    p.lastAttack = now;
+    const dmg = 8 + Math.floor(Math.random() * 10) + Math.floor(p.level * 1.5);
     t.hp -= dmg;
-    io.to(d.targetId).emit('damaged', { from: a.username, dmg });
+    if (t.id && sockets.has(t.id)) {
+      sockets.get(t.id).emit('damaged', { from: p.username, dmg });
+    }
+    io.emit('playerUpdated', { id: t.id, kills: t.kills, xp: t.xp, level: t.level, hp: t.hp });
     if (t.hp <= 0) {
-      t.hp = t.maxHp;
-      t.x = 200+Math.random()*(MAP_W*TILE-400);
-      t.y = 200+Math.random()*(MAP_H*TILE-400);
-      a.kills++; a.xp += 50 + t.level*10;
-      if (a.xp >= a.level*1000) { a.level++; a.xp=0; }
-      db.prepare('UPDATE users SET kills=?,xp=?,level=? WHERE username=?').run(a.kills,a.xp,a.level,a.username);
-      db.prepare('UPDATE users SET deaths=deaths+1 WHERE username=?').run(t.username);
-      io.emit('kill', { killer: a.username, victim: t.username });
-      io.to(d.targetId).emit('respawn', { x: t.x, y: t.y });
-      io.emit('playerUpdated', { id: socket.id, kills: a.kills, xp: a.xp, level: a.level });
+      p.kills += 1;
+      addXp(p, 50);
+      io.emit('kill', { killer: p.username, victim: t.username });
+      const spawn = randSpawn();
+      t.hp = t.maxHp; t.x = spawn.x; t.y = spawn.y;
+      if (t.id && sockets.has(t.id)) {
+        sockets.get(t.id).emit('respawn', { x: t.x, y: t.y });
+      }
+      persistPlayer(p); saveUsers();
     }
-  });
-
-  socket.on('chop', (d) => {
-    const p=gameState.players.get(socket.id); if (!p) return;
-    const tile=gameState.map[d.ty]?.[d.tx]; if (!tile||tile.type!==T.TREE) return;
-    tile.hp--;
-    if (tile.hp<=0) {
-      gameState.map[d.ty][d.tx]={ type:T.GRASS, owner:null, hp:0 };
-      p.wood+=8;
-      socket.emit('resources',{wood:p.wood,stone:p.stone,food:p.food,gold:p.gold});
-      io.emit('tileChanged',{tx:d.tx,ty:d.ty,tile:gameState.map[d.ty][d.tx]});
-      socket.emit('notif','+8 🪵 چوب!');
-    }
-  });
-
-  socket.on('mine', (d) => {
-    const p=gameState.players.get(socket.id); if (!p) return;
-    const tile=gameState.map[d.ty]?.[d.tx]; if (!tile||tile.type!==T.STONE) return;
-    tile.hp--;
-    if (tile.hp<=0) {
-      gameState.map[d.ty][d.tx]={ type:T.GRASS, owner:null, hp:0 };
-      p.stone+=6;
-      socket.emit('resources',{wood:p.wood,stone:p.stone,food:p.food,gold:p.gold});
-      io.emit('tileChanged',{tx:d.tx,ty:d.ty,tile:gameState.map[d.ty][d.tx]});
-      socket.emit('notif','+6 🪨 سنگ!');
-    }
-  });
-
-  socket.on('harvest', (d) => {
-    const p=gameState.players.get(socket.id); if (!p) return;
-    const tile=gameState.map[d.ty]?.[d.tx]; if (!tile) return;
-    if (tile.type===T.RIVER) { p.food+=5; socket.emit('notif','+5 💧 آب!'); }
-    else if ([T.CATTLE,T.SHEEP,T.CHICKEN].includes(tile.type)) {
-      p.food+=tile.type===T.CATTLE?15:tile.type===T.SHEEP?10:5;
-      gameState.map[d.ty][d.tx]={ type:T.GRASS, owner:null, hp:0 };
-      io.emit('tileChanged',{tx:d.tx,ty:d.ty,tile:gameState.map[d.ty][d.tx]});
-      socket.emit('notif','🍖 غذا گرفتی!');
-    }
-    socket.emit('resources',{wood:p.wood,stone:p.stone,food:p.food,gold:p.gold});
-  });
-
-  socket.on('build', (d) => {
-    const p=gameState.players.get(socket.id); if (!p) return;
-    const tile=gameState.map[d.ty]?.[d.tx]; if (!tile||tile.type!==T.GRASS) { socket.emit('notif','❌ اینجا نمیشه'); return; }
-    const costs={20:{wood:15,stone:5},21:{wood:10,stone:20},22:{stone:8},23:{wood:50,stone:80},24:{wood:20}};
-    const cost=costs[d.type]; if (!cost) return;
-    for (const [r,a] of Object.entries(cost)) if (p[r]<a) { socket.emit('notif','❌ منابع کافی نیست'); return; }
-    for (const [r,a] of Object.entries(cost)) p[r]-=a;
-    gameState.map[d.ty][d.tx]={ type:d.type, owner:socket.id, hp:30 };
-    p.territory.push(`${d.tx},${d.ty}`);
-    socket.emit('resources',{wood:p.wood,stone:p.stone,food:p.food,gold:p.gold});
-    io.emit('tileChanged',{tx:d.tx,ty:d.ty,tile:gameState.map[d.ty][d.tx]});
-    socket.emit('notif','✅ ساخته شد!');
-  });
-
-  socket.on('recruit', (d) => {
-    const p=gameState.players.get(socket.id); if (!p) return;
-    if (p.gold<40||p.food<20) { socket.emit('notif','❌ منابع کافی نیست'); return; }
-    p.gold-=40; p.food-=20;
-    socket.emit('resources',{wood:p.wood,stone:p.stone,food:p.food,gold:p.gold});
-    socket.emit('notif','⚔️ سرباز استخدام شد!');
+    io.emit('playerUpdated', { id: p.id, kills: p.kills, xp: p.xp, level: p.level, hp: p.hp });
   });
 
   socket.on('chat', (msg) => {
-    if (currentUser) io.emit('chat',{ username:currentUser, msg:String(msg).slice(0,100) });
+    const p = players.get(socket.id);
+    if (!p || !msg) return;
+    const clean = String(msg).slice(0, 80);
+    io.emit('chat', { username: p.username, msg: clean });
   });
 
-  socket.on('report', (d) => {
-    if (currentUser) {
-      db.prepare('INSERT INTO reports (reporter,reported,reason) VALUES (?,?,?)').run(currentUser,d.reported,d.reason);
-      socket.emit('notif','✅ گزارش ثبت شد');
-    }
+  socket.on('report', ({ reported, reason }) => {
+    const p = players.get(socket.id);
+    if (!p) return;
+    console.log(`[REPORT] ${p.username} reported ${reported}: ${reason}`);
+    socket.emit('notif', '✅ گزارش به ادمین ارسال شد');
   });
 
   socket.on('disconnect', () => {
-    if (currentUser) { onlinePlayers.delete(currentUser); io.emit('systemMsg',`👋 ${currentUser} رفت`); }
-    const p=gameState.players.get(socket.id);
-    if (p) db.prepare('UPDATE users SET xp=?,level=?,kills=? WHERE username=?').run(p.xp,p.level,p.kills,p.username);
-    gameState.players.delete(socket.id);
-    io.emit('playerLeft', socket.id);
+    const p = players.get(socket.id);
+    if (p) {
+      persistPlayer(p);
+      saveUsers();
+      players.delete(socket.id);
+      io.emit('playerLeft', socket.id);
+      io.emit('systemMsg', `👋 ${p.username} خروج کرد`);
+      broadcastPlayerList();
+    }
+    sockets.delete(socket.id);
   });
 });
 
+function inBounds(tx, ty) { return tx >= 0 && tx < MAP_W && ty >= 0 && ty < MAP_H; }
+function nearTile(p, tx, ty) {
+  const px = p.x / TPX, py = p.y / TPX;
+  return Math.abs(px - tx) < 3 && Math.abs(py - ty) < 3;
+}
+function resourcesOf(p) { return { wood: p.wood, stone: p.stone, food: p.food, gold: p.gold }; }
+
 setInterval(() => {
-  for (const [id,p] of gameState.players) {
-    p.gold+=3+p.level; p.food+=1;
-    io.to(id).emit('resources',{wood:p.wood,stone:p.stone,food:p.food,gold:p.gold});
+  for (const [id, p] of players) {
+    if (p.isBot) continue;
+    p.gold += 3 + p.level;
+    p.food += 1;
+    if (sockets.has(id)) {
+      sockets.get(id).emit('resources', resourcesOf(p));
+    }
   }
 }, 10000);
 
-server.listen(PORT, () => console.log(`🏰 Kingdom World on port ${PORT}`));
+setInterval(() => {
+  for (const [, p] of players) persistPlayer(p);
+  saveUsers();
+}, 30000);
+
+server.listen(PORT, () => console.log(`🏰 Kingdom World server running on port ${PORT}`));
